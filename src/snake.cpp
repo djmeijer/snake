@@ -18,6 +18,7 @@
 #include <memory>
 #include <functional>
 #include <optional>
+#include <random>
 #include <thread>
 #include <mutex>
 
@@ -107,16 +108,59 @@ struct Config {
 };
 
 std::array<int, 9> const default_cell_variant_penalties = {
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
+  8233,
+  9137,
+  3141,
+  3766,
+  1242,
+  9430,
+  1569,
+  4886,
+  5472
 };
+
+constexpr int min_cell_tree_penalty = 0;
+constexpr int max_cell_tree_penalty = 100000;
+
+int normalize_cell_tree_penalty(int value) {
+  if (value < min_cell_tree_penalty || value > max_cell_tree_penalty) {
+    throw std::invalid_argument(
+      "Cell-tree penalties must be between "
+      + std::to_string(min_cell_tree_penalty)
+      + " and "
+      + std::to_string(max_cell_tree_penalty)
+      + "."
+    );
+  }
+  return value;
+}
+
+std::array<int, 9> normalize_cell_tree_penalties(std::array<int, 9> penalties) {
+  for (int& penalty : penalties) {
+    penalty = normalize_cell_tree_penalty(penalty);
+  }
+  return penalties;
+}
+
+std::vector<int> normalize_cell_tree_penalties(std::vector<int> const& penalties) {
+  std::vector<int> normalized;
+  normalized.reserve(penalties.size());
+  for (int penalty : penalties) {
+    normalized.push_back(normalize_cell_tree_penalty(penalty));
+  }
+  return normalized;
+}
+
+RNG make_random_rng() {
+  std::random_device device;
+  uint64_t seed0 = (static_cast<uint64_t>(device()) << 32) ^ static_cast<uint64_t>(device());
+  uint64_t seed1 = (static_cast<uint64_t>(device()) << 32) ^ static_cast<uint64_t>(device());
+  if (seed0 == 0 && seed1 == 0) {
+    seed1 = 1;
+  }
+  uint64_t state[] = {seed0, seed1};
+  return RNG(state);
+}
 
 void apply_cell_tree_penalties(CellTreeAgent& agent, std::array<int, 9> const& penalties) {
   auto param = penalties.begin();
@@ -216,6 +260,7 @@ void print_help(const char* name, std::ostream& out = std::cout) {
   out << "  help                Show this message." << endl;
   out << "  list                List available agents." << endl;
   out << "  all                 Play all agents against each other, output csv summary." << endl;
+  out << "  optimize-cell       Tune cell-tree penalties with coarse-to-fine search." << endl;
   out << "  <agent>             Play with the given agent." << endl;
   out << endl;
   out << "Optional arguments:" << endl;
@@ -230,7 +275,7 @@ void print_help(const char* name, std::ostream& out = std::cout) {
   out << "      --json-full     Don't encode json file to save size." << endl;
   out << "  -j, --threads <n>   Specify the maximum number of threads (default: " << def.num_threads << ")." << endl;
   out << "      --penalties <same> <new> <parent> <edge-in> <wall-in> <open-in> <edge-out> <wall-out> <open-out>" << endl;
-  out << "                      Override the 9 cell-tree penalties used by cell-variant." << endl;
+  out << "                      Override the 9 cell-tree penalties used by cell-variant (range: 0-100000)." << endl;
   out << endl;
   list_agents(out);
 }
@@ -265,7 +310,7 @@ void Config::parse_optional_args(int argc, const char** argv) {
       for (int j = 0; j < static_cast<int>(penalties.size()); ++j) {
         penalties[j] = std::stoi(argv[++i]);
       }
-      cell_variant_penalties = penalties;
+      cell_variant_penalties = normalize_cell_tree_penalties(penalties);
     } else if (arg == "-t" || arg == "--trace") {
       trace = Trace::eat;
       num_rounds = 1;
@@ -547,12 +592,13 @@ struct ParameterizedAgentFactory {
 };
 
 struct ParameterizedCellTreeAgent : ParameterizedAgentFactory {
-  ParameterizedCellTreeAgent() : ParameterizedAgentFactory(9,0,1000) {}
+  ParameterizedCellTreeAgent() : ParameterizedAgentFactory(9, min_cell_tree_penalty, max_cell_tree_penalty) {}
   
   std::unique_ptr<Agent> make(std::vector<int> params, Config&) const override {
     auto agent = std::make_unique<CellTreeAgent>();
     std::array<int, 9> penalties;
-    std::copy(params.begin(), params.end(), penalties.begin());
+    auto normalized_params = normalize_cell_tree_penalties(params);
+    std::copy(normalized_params.begin(), normalized_params.end(), penalties.begin());
     apply_cell_tree_penalties(*agent, penalties);
     return agent;
   }
@@ -562,20 +608,61 @@ double score(Stats const& stats) {
   return mean(stats.turns) + 1e10 * (1 - mean(stats.wins));
 }
 
+
+void write_params(std::ostream& out, std::vector<int> const& params) {
+  bool first = true;
+  for (int param : params) {
+    if (!first) {
+      out << ' ';
+    }
+    first = false;
+    out << param;
+  }
+}
+
+int quantize_parameter(int value, int lower_bound, int upper_bound, int step) {
+  value = std::max(lower_bound, std::min(upper_bound, value));
+  if (step <= 1) {
+    return value;
+  }
+
+  int first_quantized = ((lower_bound + step - 1) / step) * step;
+  int last_quantized = (upper_bound / step) * step;
+  if (first_quantized > last_quantized) {
+    return value;
+  }
+
+  int quantized = static_cast<int>(std::llround(static_cast<double>(value) / static_cast<double>(step))) * step;
+  return std::max(first_quantized, std::min(last_quantized, quantized));
+}
+
+std::vector<int> quantize_parameters(
+  pagmo::vector_double const& values,
+  std::vector<int> const& lower_bounds,
+  std::vector<int> const& upper_bounds,
+  int step
+) {
+  std::vector<int> params;
+  params.reserve(values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    params.push_back(quantize_parameter(static_cast<int>(std::llround(values[i])), lower_bounds[i], upper_bounds[i], step));
+  }
+  return params;
+}
+
 struct ParameterOptimizationProblem {
   ParameterizedAgentFactory const* agent = nullptr;
   Config config;
+  std::vector<int> min_param_value;
+  std::vector<int> max_param_value;
+  int quantization_step = 1;
 
   pagmo::vector_double fitness(pagmo::vector_double const& x) const {
-    std::vector<int> params;
-    params.reserve(x.size());
-    for (size_t i = 0; i < x.size(); ++i) {
-      auto value = static_cast<int>(std::llround(x[i]));
-      value = std::max(agent->min_param_value[i], std::min(agent->max_param_value[i], value));
-      params.push_back(value);
-    }
+    auto params = quantize_parameters(x, min_param_value, max_param_value, quantization_step);
+    params = normalize_cell_tree_penalties(params);
 
     Config eval_config = config;
+    eval_config.rng = make_random_rng();
     auto stats = play_multiple([this, &params](Config& config) {
       return agent->make(params, config);
     }, eval_config);
@@ -587,8 +674,8 @@ struct ParameterOptimizationProblem {
     pagmo::vector_double upper;
     lower.reserve(agent->num_params());
     upper.reserve(agent->num_params());
-    for (auto value : agent->min_param_value) lower.push_back(static_cast<double>(value));
-    for (auto value : agent->max_param_value) upper.push_back(static_cast<double>(value));
+    for (auto value : min_param_value) lower.push_back(static_cast<double>(value));
+    for (auto value : max_param_value) upper.push_back(static_cast<double>(value));
     return {lower, upper};
   }
 
@@ -601,19 +688,35 @@ struct ParameterOptimizationProblem {
   }
 };
 
-void optimize_agent(ParameterizedAgentFactory& agent, Config& config, std::ostream& out = std::cout) {
+struct OptimizationStageResult {
+  std::vector<int> best_params;
+  double best_score = 0;
+};
+
+OptimizationStageResult optimize_agent_stage(
+  ParameterizedAgentFactory& agent,
+  Config const& config,
+  std::vector<int> const& min_param_value,
+  std::vector<int> const& max_param_value,
+  int quantization_step,
+  unsigned generations,
+  unsigned random_seed,
+  std::string const& stage_name,
+  std::ostream& out
+) {
   using namespace std;
 
-  auto random_seed = static_cast<unsigned>(config.rng.next());
   ParameterOptimizationProblem udp;
   udp.agent = &agent;
   udp.config = config;
   udp.config.quiet = true;
+  udp.min_param_value = min_param_value;
+  udp.max_param_value = max_param_value;
+  udp.quantization_step = quantization_step;
   pagmo::problem problem{udp};
 
   unsigned population_size = static_cast<unsigned>(max<size_t>(20, agent.num_params() * 4));
   if (population_size % 2 != 0) ++population_size;
-  unsigned generations = 250u;
   double mutation_probability = 1.0 / static_cast<double>(agent.num_params());
 
   pagmo::population population{problem, population_size, random_seed};
@@ -623,25 +726,68 @@ void optimize_agent(ParameterizedAgentFactory& agent, Config& config, std::ostre
     };
     population = algorithm.evolve(population);
 
-    std::vector<int> current_best_params;
-    current_best_params.reserve(agent.num_params());
-    for (double value : population.champion_x()) {
-      current_best_params.push_back(static_cast<int>(std::llround(value)));
-    }
+    auto current_best_params = quantize_parameters(population.champion_x(), min_param_value, max_param_value, quantization_step);
 
-    out << "generation " << generation << "/" << generations;
+    out << stage_name << " generation " << generation << "/" << generations;
     out << " best score: " << population.champion_f()[0];
-    out << " params: " << current_best_params << endl;
+    out << " params: ";
+    write_params(out, current_best_params);
+    out << endl;
   }
 
-  std::vector<int> best_params;
-  best_params.reserve(agent.num_params());
-  for (double value : population.champion_x()) {
-    best_params.push_back(static_cast<int>(std::llround(value)));
+  OptimizationStageResult result;
+  result.best_params = quantize_parameters(population.champion_x(), min_param_value, max_param_value, quantization_step);
+  result.best_score = population.champion_f()[0];
+  return result;
+}
+
+void optimize_agent(ParameterizedAgentFactory& agent, Config& config, std::ostream& out = std::cout) {
+  using namespace std;
+
+  auto random_seed = static_cast<unsigned>(config.rng.next());
+  constexpr int coarse_quantization_step = 500;
+  constexpr int refine_quantization_step = 50;
+  constexpr int refine_radius = 500;
+  constexpr unsigned coarse_generations = 120u;
+  constexpr unsigned refine_generations = 130u;
+
+  auto coarse_result = optimize_agent_stage(
+    agent,
+    config,
+    agent.min_param_value,
+    agent.max_param_value,
+    coarse_quantization_step,
+    coarse_generations,
+    random_seed,
+    "coarse",
+    out
+  );
+
+  vector<int> refine_min_param_value;
+  vector<int> refine_max_param_value;
+  refine_min_param_value.reserve(agent.num_params());
+  refine_max_param_value.reserve(agent.num_params());
+  for (size_t i = 0; i < agent.num_params(); ++i) {
+    refine_min_param_value.push_back(max(agent.min_param_value[i], coarse_result.best_params[i] - refine_radius));
+    refine_max_param_value.push_back(min(agent.max_param_value[i], coarse_result.best_params[i] + refine_radius));
   }
 
-  out << "best score: " << population.champion_f()[0] << endl;
-  out << "best params: " << best_params << endl;
+  auto refined_result = optimize_agent_stage(
+    agent,
+    config,
+    refine_min_param_value,
+    refine_max_param_value,
+    refine_quantization_step,
+    refine_generations,
+    random_seed + coarse_generations + 1u,
+    "refine",
+    out
+  );
+
+  out << "coarse best score: " << coarse_result.best_score << endl;
+  out << "coarse best params: " << coarse_result.best_params << endl;
+  out << "best score: " << refined_result.best_score << endl;
+  out << "best params: " << refined_result.best_params << endl;
 }
 
 //------------------------------------------------------------------------------
