@@ -5,12 +5,20 @@
 #include "cell_tree_agent.hpp"
 #include "hamiltonian_cycle.hpp"
 
+#include <pagmo/algorithm.hpp>
+#include <pagmo/algorithms/sga.hpp>
+#include <pagmo/population.hpp>
+#include <pagmo/problem.hpp>
+#include <pagmo/types.hpp>
+
 #include <unistd.h>
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <memory>
 #include <functional>
+#include <optional>
 #include <thread>
 #include <mutex>
 
@@ -94,9 +102,35 @@ struct Config {
   std::string json_file;
   bool json_compact = true;
   RNG rng = global_rng;
+  std::optional<std::array<int, 9>> cell_variant_penalties;
   
   void parse_optional_args(int argc, const char** argv);
 };
+
+std::array<int, 9> const default_cell_variant_penalties = {
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+};
+
+void apply_cell_tree_penalties(CellTreeAgent& agent, std::array<int, 9> const& penalties) {
+  auto param = penalties.begin();
+  agent.same_cell_penalty = *param++;
+  agent.new_cell_penalty = *param++;
+  agent.parent_cell_penalty = *param++;
+  agent.edge_penalty_in = *param++;
+  agent.wall_penalty_in = *param++;
+  agent.open_penalty_in = *param++;
+  agent.edge_penalty_out = *param++;
+  agent.wall_penalty_out = *param++;
+  agent.open_penalty_out = *param++;
+}
 
 //------------------------------------------------------------------------------
 // Agents
@@ -135,11 +169,9 @@ AgentFactory agents[] = {
     agent->recalculate_path = false;
     return agent;
   }},
-  {"cell-variant", "Cell tree agent with penalties on moving in the tree", [](Config&) {
+  {"cell-variant", "Cell tree agent with penalties on moving in the tree", [](Config& config) {
     auto agent = std::make_unique<CellTreeAgent>();
-    agent->same_cell_penalty = 500-1;
-    agent->new_cell_penalty = 2400;
-    agent->parent_cell_penalty = 0;
+    apply_cell_tree_penalties(*agent, config.cell_variant_penalties.value_or(default_cell_variant_penalties));
     return agent;
   }},
   {"phc", "Perturbed Hamiltonian cycle (zig-zag cycle)", [](Config& config) {
@@ -198,6 +230,8 @@ void print_help(const char* name, std::ostream& out = std::cout) {
   out << "      --json <file>   Write log of one run a json file." << endl;
   out << "      --json-full     Don't encode json file to save size." << endl;
   out << "  -j, --threads <n>   Specify the maximum number of threads (default: " << def.num_threads << ")." << endl;
+  out << "      --penalties <same> <new> <parent> <edge-in> <wall-in> <open-in> <edge-out> <wall-out> <open-out>" << endl;
+  out << "                      Override the 9 cell-tree penalties used by cell-variant." << endl;
   out << endl;
   list_agents(out);
 }
@@ -226,6 +260,13 @@ void Config::parse_optional_args(int argc, const char** argv) {
     } else if (arg == "--json") {
       if (i+1 >= argc) throw std::invalid_argument("Missing argument to " + arg);
       json_file = argv[++i];
+    } else if (arg == "--penalties") {
+      if (i+9 >= argc) throw std::invalid_argument("Missing arguments to " + arg + ": expected 9 penalty values");
+      std::array<int, 9> penalties;
+      for (int j = 0; j < static_cast<int>(penalties.size()); ++j) {
+        penalties[j] = std::stoi(argv[++i]);
+      }
+      cell_variant_penalties = penalties;
     } else if (arg == "-t" || arg == "--trace") {
       trace = Trace::eat;
       num_rounds = 1;
@@ -449,7 +490,7 @@ Stats play_multiple_threaded(AgentGen make_agent, Config& config) {
     t.join();
   }
   // done
-  if (!config.quiet) std::cout << "\033[K\r";
+  if (!config.quiet) std::cout << std::endl;
   return stats;
 }
 
@@ -467,7 +508,7 @@ Stats play_multiple(AgentGen make_agent, Config& config) {
       std::cout << (i+1) << "/" << config.num_rounds << "  " << stats << "\033[K\r" << std::flush;
     }
   }
-  if (!config.quiet) std::cout << "\033[K\r";
+  if (!config.quiet) std::cout << std::endl;
   return stats;
 }
 
@@ -492,7 +533,7 @@ void play_all_agents(Config& config, std::ostream& out = std::cout) {
 
 //------------------------------------------------------------------------------
 // Optimization
-// This is a hacky algorihtm to optimize algorithm parameters
+// Tune agent parameters with a simple genetic algorithm.
 //------------------------------------------------------------------------------
 
 struct ParameterizedAgentFactory {
@@ -507,21 +548,13 @@ struct ParameterizedAgentFactory {
 };
 
 struct ParameterizedCellTreeAgent : ParameterizedAgentFactory {
-  ParameterizedCellTreeAgent() : ParameterizedAgentFactory(9,0,5000) {}
+  ParameterizedCellTreeAgent() : ParameterizedAgentFactory(9,0,1000) {}
   
   std::unique_ptr<Agent> make(std::vector<int> params, Config&) const override {
     auto agent = std::make_unique<CellTreeAgent>();
-    auto param = params.begin();
-    agent->same_cell_penalty = *param++;
-    agent->new_cell_penalty = *param++;
-    agent->parent_cell_penalty = *param++;
-    agent->edge_penalty_in = *param++;
-    agent->wall_penalty_in = *param++;
-    agent->open_penalty_in = *param++;
-    agent->edge_penalty_out = *param++;
-    agent->wall_penalty_out = *param++;
-    agent->open_penalty_out = *param++;
-    assert(param == params.end());
+    std::array<int, 9> penalties;
+    std::copy(params.begin(), params.end(), penalties.begin());
+    apply_cell_tree_penalties(*agent, penalties);
     return agent;
   }
 };
@@ -530,34 +563,86 @@ double score(Stats const& stats) {
   return mean(stats.turns) + 1e10 * (1 - mean(stats.wins));
 }
 
+struct ParameterOptimizationProblem {
+  ParameterizedAgentFactory const* agent = nullptr;
+  Config config;
+
+  pagmo::vector_double fitness(pagmo::vector_double const& x) const {
+    std::vector<int> params;
+    params.reserve(x.size());
+    for (size_t i = 0; i < x.size(); ++i) {
+      auto value = static_cast<int>(std::llround(x[i]));
+      value = std::max(agent->min_param_value[i], std::min(agent->max_param_value[i], value));
+      params.push_back(value);
+    }
+
+    Config eval_config = config;
+    auto stats = play_multiple([this, &params](Config& config) {
+      return agent->make(params, config);
+    }, eval_config);
+    return {::score(stats)};
+  }
+
+  std::pair<pagmo::vector_double, pagmo::vector_double> get_bounds() const {
+    pagmo::vector_double lower;
+    pagmo::vector_double upper;
+    lower.reserve(agent->num_params());
+    upper.reserve(agent->num_params());
+    for (auto value : agent->min_param_value) lower.push_back(static_cast<double>(value));
+    for (auto value : agent->max_param_value) upper.push_back(static_cast<double>(value));
+    return {lower, upper};
+  }
+
+  pagmo::vector_double::size_type get_nix() const {
+    return agent->num_params();
+  }
+
+  std::string get_name() const {
+    return "snake parameter optimization";
+  }
+};
+
 void optimize_agent(ParameterizedAgentFactory& agent, Config& config, std::ostream& out = std::cout) {
   using namespace std;
-  int num_runs = 1000;
-  int step_size = 100;
-  double best_score = 1e100;
-  std::vector<int> best_params = agent.min_param_value;
-  for (int i = 0; i < num_runs; ++i) {
-    std::vector<int> params = best_params;
-    size_t which = i % (agent.num_params() + 1);
-    if (which == 0) {
-      // re-run
-    } else {
-      size_t j = which - 1;
-      do {
-        int delta = config.rng.random(step_size*2+1) - step_size;
-        params[j] = std::max(agent.min_param_value[j], std::min(agent.max_param_value[j], params[j] + delta));
-      } while (params[j] == best_params[j]);
+
+  auto random_seed = static_cast<unsigned>(config.rng.next());
+  ParameterOptimizationProblem udp;
+  udp.agent = &agent;
+  udp.config = config;
+  udp.config.quiet = true;
+  pagmo::problem problem{udp};
+
+  unsigned population_size = static_cast<unsigned>(max<size_t>(20, agent.num_params() * 4));
+  if (population_size % 2 != 0) ++population_size;
+  unsigned generations = 250u;
+  double mutation_probability = 1.0 / static_cast<double>(agent.num_params());
+
+  pagmo::population population{problem, population_size, random_seed};
+  for (unsigned generation = 1; generation <= generations; ++generation) {
+    pagmo::algorithm algorithm{
+      pagmo::sga(1u, 0.9, 1.0, mutation_probability, 1.0, 2u, "single", "uniform", "tournament", random_seed + generation)
+    };
+    population = algorithm.evolve(population);
+
+    std::vector<int> current_best_params;
+    current_best_params.reserve(agent.num_params());
+    for (double value : population.champion_x()) {
+      current_best_params.push_back(static_cast<int>(std::llround(value)));
     }
-    auto stats = play_multiple([&agent,&params](Config& config){return agent.make(params, config);}, config);
-    auto score = ::score(stats);
-    std::cout << (which == 0 ? yellow : score < best_score ? green : white)(std::to_string(score));
-    std::cout << ":  " << params;
-    std::cout << std::endl;
-    if (which == 0 || score < best_score) {
-      best_score = score;
-      best_params = params;
-    }
+
+    out << "generation " << generation << "/" << generations;
+    out << " best score: " << population.champion_f()[0];
+    out << " params: " << current_best_params << endl;
   }
+
+  std::vector<int> best_params;
+  best_params.reserve(agent.num_params());
+  for (double value : population.champion_x()) {
+    best_params.push_back(static_cast<int>(std::llround(value)));
+  }
+
+  out << "best score: " << population.champion_f()[0] << endl;
+  out << "best params: " << best_params << endl;
 }
 
 //------------------------------------------------------------------------------

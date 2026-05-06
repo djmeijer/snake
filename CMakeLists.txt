@@ -9,6 +9,7 @@ include_directories("${PROJECT_BINARY_DIR}/src")
 include_directories("${PROJECT_SOURCE_DIR}/src")
 
 find_package (Threads)
+find_package(Pagmo REQUIRED)
 
 # snake executable
 
@@ -17,6 +18,7 @@ add_executable(snake)
 file(GLOB_RECURSE sources src/*.cpp)
 target_sources(snake PRIVATE ${sources})
 target_link_libraries(${PROJECT_NAME} Threads::Threads)
+target_link_libraries(${PROJECT_NAME} Pagmo::pagmo)
 
 # warnings
 if(CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_GNUCXX)
