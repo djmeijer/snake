@@ -73,13 +73,44 @@ Dir move_to_parent(Grid<Coord> const& cell_parents, Coord a) {
   throw "move_to_parent";
 }
 
-
 Unreachables cell_tree_unreachables(GameBase const& game, Grid<Step> const& dists) {
   auto cell_parents = cell_tree_parents(game.dimensions(), game.snake);
   auto can_move = [&](Coord from, Coord to, Dir dir) {
     return can_move_in_cell_tree(cell_parents, from, to, dir) && !game.grid[to];
   };
   return unreachables(can_move, game, dists);
+}
+
+bool should_use_cached_path_for_move_tail(const Unreachables& unreachable, Lookahead lookahead, const std::vector<Coord>& cached_path) {
+  if (lookahead == Lookahead::many_move_tail) {
+    if ((unreachable.any) && (unreachable.dist_to_farthest >= INT_MAX) && !cached_path.empty()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+Unreachables get_unreachables(
+    const GameBase& game, 
+    const std::vector<Coord>& path, 
+    Lookahead lookahead, 
+    const Grid<Step>& dists) {
+  if (lookahead == Lookahead::many_move_tail) {
+    auto after = after_moves(game, path, Lookahead::many_move_tail);
+    auto unreachable = cell_tree_unreachables(after, dists);
+    
+    if (!unreachable.any) {
+      return unreachable;
+    } else {
+      auto after = after_moves(game, path, Lookahead::many_keep_tail);
+      auto unreachable = cell_tree_unreachables(after, dists);
+      return unreachable;
+    }
+  } else {
+    auto after = after_moves(game, path, lookahead);
+    auto unreachable = cell_tree_unreachables(after, dists);
+    return unreachable;
+  }
 }
 
 enum class DetourStrategy {
@@ -156,9 +187,14 @@ public:
     }
     
     // Heuristic 3: prevent making parts of the grid unreachable
-    if (detour != DetourStrategy::none) {
-      auto after = after_moves(game, path, lookahead);
-      auto unreachable = cell_tree_unreachables(after, dists);
+    if (detour != DetourStrategy::none) {    
+      const Unreachables unreachable = get_unreachables(game, path, lookahead, dists);
+      if (should_use_cached_path_for_move_tail(unreachable, lookahead, cached_path)) {
+        pos2 = cached_path.back();
+        cached_path.pop_back();
+        return pos2 - pos;
+      }
+      
       if (unreachable.any) {
         if (log) {
           Grid<bool> unreachable_grid(game.dimensions());
@@ -206,4 +242,3 @@ public:
     return pos2 - pos;
   }
 };
-
