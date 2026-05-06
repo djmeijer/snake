@@ -11,7 +11,6 @@
 #include <pagmo/problem.hpp>
 #include <pagmo/types.hpp>
 
-#include <unistd.h>
 #include <array>
 #include <cmath>
 #include <fstream>

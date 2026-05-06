@@ -98,8 +98,12 @@ inline Dir operator - (Coord a, Coord b) {
   throw std::logic_error("Not a dir");
 }
 
+inline constexpr int abs_constexpr(int x) {
+  return x < 0 ? -x : x;
+}
+
 inline constexpr int manhattan_distance(Coord a, Coord b) {
-  return std::abs(a.x - b.x) + std::abs(a.y - b.y);
+  return abs_constexpr(a.x - b.x) + abs_constexpr(a.y - b.y);
 }
 
 inline constexpr bool is_neighbor(Coord a, Coord b) {
