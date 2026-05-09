@@ -205,6 +205,17 @@ public:
         path.push_back(pos2);
       }
     }
+
+    if (path.empty() || pos2 == INVALID) {
+      cached_path.clear();
+      for (auto dir : dirs) {
+        Coord next = pos + dir;
+        if (game.grid.is_clear(next)) {
+          return dir;
+        }
+      }
+      return Dir::up;
+    }
     
     if (log) {
       auto path_copy = path;
@@ -263,7 +274,9 @@ public:
     
     // use as new cached path
     cached_path = std::move(path);
-    cached_path.pop_back();
+    if (!cached_path.empty()) {
+      cached_path.pop_back();
+    }
     
     return pos2 - pos;
   }
