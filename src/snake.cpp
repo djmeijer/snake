@@ -209,7 +209,7 @@ struct Config {
   std::string json_file;
   bool json_compact = true;
   RNG rng = global_rng;
-  std::optional<std::array<int, 9>> cell_variant_penalties;
+  std::optional<std::vector<CellTreeAgent::PenaltySet>> cell_variant_penalties;
   
   void parse_optional_args(int argc, const char** argv);
 
@@ -224,7 +224,7 @@ struct Config {
   double expert_step_penalty = -0.002;
 };
 
-std::array<int, 9> const default_cell_variant_penalties = {
+CellTreeAgent::PenaltySet const default_cell_variant_penalties = {
   63270,
   91375,
   11566,
@@ -259,11 +259,32 @@ std::array<int, 9> normalize_cell_tree_penalties(std::array<int, 9> penalties) {
   return penalties;
 }
 
-std::vector<int> normalize_cell_tree_penalties(std::vector<int> const& penalties) {
+std::vector<int> normalize_flat_cell_tree_penalties(std::vector<int> const& penalties) {
   std::vector<int> normalized;
   normalized.reserve(penalties.size());
   for (int penalty : penalties) {
     normalized.push_back(normalize_cell_tree_penalty(penalty));
+  }
+  return normalized;
+}
+
+std::vector<CellTreeAgent::PenaltySet> normalize_cell_tree_penalties(std::vector<int> const& penalties) {
+  if (penalties.empty() || penalties.size() % CellTreeAgent::penalty_count != 0) {
+    throw std::invalid_argument(
+      "Cell-tree penalties must be provided in groups of "
+      + std::to_string(CellTreeAgent::penalty_count)
+      + "."
+    );
+  }
+
+  std::vector<CellTreeAgent::PenaltySet> normalized;
+  normalized.reserve(penalties.size() / CellTreeAgent::penalty_count);
+  for (size_t offset = 0; offset < penalties.size(); offset += CellTreeAgent::penalty_count) {
+    CellTreeAgent::PenaltySet penalty_set;
+    for (size_t index = 0; index < CellTreeAgent::penalty_count; ++index) {
+      penalty_set[index] = normalize_cell_tree_penalty(penalties[offset + index]);
+    }
+    normalized.push_back(penalty_set);
   }
   return normalized;
 }
@@ -280,16 +301,11 @@ RNG make_random_rng() {
 }
 
 void apply_cell_tree_penalties(CellTreeAgent& agent, std::array<int, 9> const& penalties) {
-  auto param = penalties.begin();
-  agent.same_cell_penalty = *param++;
-  agent.new_cell_penalty = *param++;
-  agent.parent_cell_penalty = *param++;
-  agent.edge_penalty_in = *param++;
-  agent.wall_penalty_in = *param++;
-  agent.open_penalty_in = *param++;
-  agent.edge_penalty_out = *param++;
-  agent.wall_penalty_out = *param++;
-  agent.open_penalty_out = *param++;
+  agent.phase_penalties = {penalties};
+}
+
+void apply_cell_tree_penalties(CellTreeAgent& agent, std::vector<CellTreeAgent::PenaltySet> const& penalties) {
+  agent.phase_penalties = penalties;
 }
 
 //------------------------------------------------------------------------------
@@ -331,7 +347,7 @@ AgentFactory agents[] = {
   }},
   {"cell-variant", "Cell tree agent with penalties on moving in the tree", [](Config& config) {
     auto agent = std::make_unique<CellTreeAgent>();
-    apply_cell_tree_penalties(*agent, config.cell_variant_penalties.value_or(default_cell_variant_penalties));
+    apply_cell_tree_penalties(*agent, config.cell_variant_penalties.value_or(std::vector<CellTreeAgent::PenaltySet>{default_cell_variant_penalties}));
     return agent;
   }},
   {"phc", "Perturbed Hamiltonian cycle (zig-zag cycle)", [](Config& config) {
@@ -392,8 +408,9 @@ void print_help(const char* name, std::ostream& out = std::cout) {
   out << "      --json <file>   Write log of one run a json file." << endl;
   out << "      --json-full     Don't encode json file to save size." << endl;
   out << "  -j, --threads <n>   Specify the maximum number of threads (default: " << def.num_threads << ")." << endl;
-  out << "      --penalties <same> <new> <parent> <edge-in> <wall-in> <open-in> <edge-out> <wall-out> <open-out>" << endl;
-  out << "                      Override the 9 cell-tree penalties used by cell-variant (range: 0-100000)." << endl;
+  out << "      --penalties <same> <new> <parent> <edge-in> <wall-in> <open-in> <edge-out> <wall-out> <open-out> [...]" << endl;
+  out << "                      Override the cell-tree penalties used by cell-variant. Provide any multiple of 9 values" << endl;
+  out << "                      (range: 0-100000); the game fill ratio selects among the provided sets." << endl;
   out << "      --out <file>    export-data output JSONL file, or '-' for stdout." << endl;
   out << "      --max-samples <n>" << endl;
   out << "                      Stop export-data after writing n samples. 0 means unlimited." << endl;
@@ -436,10 +453,16 @@ void Config::parse_optional_args(int argc, const char** argv) {
       if (i+1 >= argc) throw std::invalid_argument("Missing argument to " + arg);
       json_file = argv[++i];
     } else if (arg == "--penalties") {
-      if (i+9 >= argc) throw std::invalid_argument("Missing arguments to " + arg + ": expected 9 penalty values");
-      std::array<int, 9> penalties;
-      for (int j = 0; j < static_cast<int>(penalties.size()); ++j) {
-        penalties[j] = std::stoi(argv[++i]);
+      std::vector<int> penalties;
+      while (i + 1 < argc) {
+        std::string next = argv[i + 1];
+        if (!next.empty() && next[0] == '-') {
+          break;
+        }
+        penalties.push_back(std::stoi(argv[++i]));
+      }
+      if (penalties.empty()) {
+        throw std::invalid_argument("Missing arguments to " + arg + ": expected one or more 9-value penalty sets");
       }
       cell_variant_penalties = normalize_cell_tree_penalties(penalties);
     } else if (arg == "-t" || arg == "--trace") {
@@ -841,8 +864,8 @@ struct ParameterizedCellTreeAgent : ParameterizedAgentFactory {
   
   std::unique_ptr<Agent> make(std::vector<int> params, Config&) const override {
     auto agent = std::make_unique<CellTreeAgent>();
-    std::array<int, 9> penalties;
-    auto normalized_params = normalize_cell_tree_penalties(params);
+    auto normalized_params = normalize_flat_cell_tree_penalties(params);
+    CellTreeAgent::PenaltySet penalties;
     std::copy(normalized_params.begin(), normalized_params.end(), penalties.begin());
     apply_cell_tree_penalties(*agent, penalties);
     return agent;
@@ -904,7 +927,7 @@ struct ParameterOptimizationProblem {
 
   pagmo::vector_double fitness(pagmo::vector_double const& x) const {
     auto params = quantize_parameters(x, min_param_value, max_param_value, quantization_step);
-    params = normalize_cell_tree_penalties(params);
+    params = normalize_flat_cell_tree_penalties(params);
 
     Config eval_config = config;
     eval_config.rng = make_random_rng();

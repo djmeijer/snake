@@ -2,6 +2,9 @@
 #include "game_util.hpp"
 #include "shortest_path.hpp"
 
+#include <array>
+#include <vector>
+
 //------------------------------------------------------------------------------
 // Agent: tree based
 //------------------------------------------------------------------------------
@@ -121,20 +124,35 @@ enum class DetourStrategy {
 
 struct CellTreeAgent : Agent {
 public:
+  static constexpr size_t penalty_count = 9;
+  using PenaltySet = std::array<int, penalty_count>;
+
   // config
   bool recalculate_path = true;
   Lookahead lookahead = Lookahead::many_move_tail;
   DetourStrategy detour = DetourStrategy::nearest_unreachable;
   // penalties
-  int same_cell_penalty = 0;
-  int new_cell_penalty = 0;
-  int parent_cell_penalty = 0;
-  int edge_penalty_in = 0, edge_penalty_out = 0;
-  int wall_penalty_in = 0, wall_penalty_out = 0;
-  int open_penalty_in = 0, open_penalty_out = 0;
+  std::vector<PenaltySet> phase_penalties;
 
 private:
   std::vector<Coord> cached_path;
+
+  static PenaltySet const& zero_penalties() {
+    static const PenaltySet penalties = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    return penalties;
+  }
+
+  PenaltySet const& active_penalties(Game const& game) const {
+    if (phase_penalties.empty()) {
+      return zero_penalties();
+    }
+    double fill_ratio = static_cast<double>(game.snake.size()) / static_cast<double>(game.grid.size());
+    size_t phase = static_cast<size_t>(fill_ratio * static_cast<double>(phase_penalties.size()));
+    if (phase >= phase_penalties.size()) {
+      phase = phase_penalties.size() - 1;
+    }
+    return phase_penalties[phase];
+  }
 
 public:
   Dir operator () (Game const& game, AgentLog* log = nullptr) override {
@@ -147,6 +165,7 @@ public:
     
     // Find shortest path satisfying 1,2
     auto cell_parents = cell_tree_parents(game.dimensions(), game.snake);
+    PenaltySet const& penalties = active_penalties(game);
     auto edge = [&](Coord a, Coord b, Dir dir) {
       if (can_move_in_cell_tree(cell_parents, a, b, dir) && !game.grid[b]) {
         // small penalty for moving to same/different cell
@@ -156,9 +175,9 @@ public:
         bool hugs_edge = !game.grid.valid(b+right);
         bool hugs_wall = !hugs_edge && game.grid[b+right];
         return 1000
-          + (to_parent ? parent_cell_penalty : to_same ? same_cell_penalty : new_cell_penalty)
-          + (to_same ? (hugs_edge ? edge_penalty_in  : hugs_wall ? wall_penalty_in  : open_penalty_in)
-                     : (hugs_edge ? edge_penalty_out : hugs_wall ? wall_penalty_out : open_penalty_out));
+          + (to_parent ? penalties[2] : to_same ? penalties[0] : penalties[1])
+          + (to_same ? (hugs_edge ? penalties[3] : hugs_wall ? penalties[4] : penalties[5])
+                     : (hugs_edge ? penalties[6] : hugs_wall ? penalties[7] : penalties[8]));
       } else {
         return INT_MAX;
       }
