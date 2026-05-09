@@ -165,25 +165,32 @@ public:
     };
     auto dists = astar_shortest_path(game.grid.coords(), edge, pos, game.apple_pos, 1000);
     auto path = read_path(dists, pos, game.apple_pos);
-    auto pos2 = path.back();
+    auto pos2 = INVALID;
+    if (!path.empty() && is_neighbor(path.back(), pos)) {
+      pos2 = path.back();
+    } else if (!cached_path.empty() && is_neighbor(cached_path.back(), pos)) {
+      path = cached_path;
+      pos2 = path.back();
+    } else {
+      int best_cost = INT_MAX;
+      for (auto dir : dirs) {
+        Coord next = pos + dir;
+        int cost = edge(pos, next, dir);
+        if (cost < best_cost) {
+          best_cost = cost;
+          pos2 = next;
+        }
+      }
+      path.clear();
+      if (pos2 != INVALID) {
+        path.push_back(pos2);
+      }
+    }
     
     if (log) {
       auto path_copy = path;
       path_copy.push_back(pos);
       log->add(game.turn, AgentLog::Key::plan, std::move(path_copy));
-    }
-    
-    if (pos2 == INVALID) {
-      if (!cached_path.empty()) {
-        pos2 = cached_path.back();
-      } else {
-        // We somehow divided the grid into two parts.
-        // Hack: if we pretend that we are at the goal, then the code below will trigger
-        // because the current pos is unreachable from there.
-        // path == {apple_pos,INVALID};
-        path.pop_back();
-        pos2 = path.back();
-      }
     }
     
     // Heuristic 3: prevent making parts of the grid unreachable

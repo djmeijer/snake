@@ -26,6 +26,95 @@
 // Logging games
 //------------------------------------------------------------------------------
 
+int dir_to_notebook_action(Dir d) {
+  switch (d) {
+    case Dir::up:    return 0;
+    case Dir::right: return 1;
+    case Dir::down:  return 2;
+    case Dir::left:  return 3;
+  }
+  throw std::logic_error("bad Dir");
+}
+
+void write_coord_json(std::ostream& out, Coord c) {
+  out << "[" << c.x << "," << c.y << "]";
+}
+
+void write_policy_json(std::ostream& out, Dir action) {
+  int a = dir_to_notebook_action(action);
+  out << "[";
+  for (int i = 0; i < 4; ++i) {
+    if (i) out << ",";
+    out << (i == a ? "1.0" : "0.0");
+  }
+  out << "]";
+}
+
+struct ExpertTransition {
+  int w = 0;
+  int h = 0;
+  int turn = 0;
+  std::vector<Coord> snake;
+  Coord apple = INVALID;
+  Dir prev_action = Dir::right;
+  Dir action = Dir::right;
+  double value = 0.0;
+};
+
+ExpertTransition capture_expert_transition(
+    Game const& game,
+    Dir prev_dir,
+    Dir action
+) {
+  ExpertTransition sample;
+  sample.w = game.grid.w;
+  sample.h = game.grid.h;
+  sample.turn = game.turn;
+  sample.apple = game.apple_pos;
+  sample.prev_action = prev_dir;
+  sample.action = action;
+  for (Coord c : game.snake) {
+    sample.snake.push_back(c);
+  }
+  return sample;
+}
+
+void write_expert_row(
+    std::ostream& out,
+    ExpertTransition const& sample,
+    bool include_policy_value
+) {
+  out << "{";
+
+  out << "\"w\":" << sample.w << ",";
+  out << "\"h\":" << sample.h << ",";
+  out << "\"turn\":" << sample.turn << ",";
+
+  out << "\"snake\":[";
+  bool first = true;
+  for (Coord c : sample.snake) {
+    if (!first) out << ",";
+    first = false;
+    write_coord_json(out, c);
+  }
+  out << "],";
+
+  out << "\"apple\":";
+  write_coord_json(out, sample.apple);
+  out << ",";
+
+  out << "\"prev_action\":" << dir_to_notebook_action(sample.prev_action) << ",";
+  out << "\"action\":" << dir_to_notebook_action(sample.action);
+
+  if (include_policy_value) {
+    out << ",\"policy\":";
+    write_policy_json(out, sample.action);
+    out << ",\"value\":" << std::setprecision(9) << sample.value;
+  }
+
+  out << "}\n";
+}
+
 struct Log {
   std::vector<Coord> snake_pos;
   std::vector<int>   snake_size;
@@ -76,10 +165,28 @@ void Stats::add(Game const& game) {
   }
 }
 
+namespace {
+
+void print_turn_stats(std::ostream& out, std::vector<int> const& turns) {
+  out << "mean " << mean(turns);
+  out << ", stddev " << stddev(turns);
+  if (turns.empty()) {
+    out << ", min -, median -, max -";
+    return;
+  }
+
+  auto q = quantiles(turns);
+  out << ", min " << q.front();
+  out << ", median " << q[2];
+  out << ", max " << q.back();
+  out << ", quantiles " << q;
+}
+
+}
+
 std::ostream& operator << (std::ostream& out, Stats const& stats) {
-  out << "turns: mean " << mean(stats.turns);
-  out << ", stddev " << stddev(stats.turns);
-  out << ", quantiles " << quantiles(stats.turns);
+  out << "turns: ";
+  print_turn_stats(out, stats.turns);
   if (mean(stats.wins) < 1) {
     out << "  LOST: " << (1-mean(stats.wins))*100 << "%";
   }
@@ -105,18 +212,28 @@ struct Config {
   std::optional<std::array<int, 9>> cell_variant_penalties;
   
   void parse_optional_args(int argc, const char** argv);
+
+  std::string expert_out = "-";
+  int max_samples = 0; // 0 means unlimited
+  bool skip_length_one = true;
+  bool expert_policy_value = false;
+  double expert_gamma = 0.98;
+  double expert_reward_apple = 0.10;
+  double expert_reward_win = 1.00;
+  double expert_reward_loss = -1.00;
+  double expert_step_penalty = -0.002;
 };
 
 std::array<int, 9> const default_cell_variant_penalties = {
-  8233,
-  9137,
-  3141,
-  3766,
-  1242,
-  9430,
-  1569,
-  4886,
-  5472
+  63270,
+  91375,
+  11566,
+  37666,
+  16482,
+  94303,
+  38397,
+  52842,
+  52566
 };
 
 constexpr int min_cell_tree_penalty = 0;
@@ -261,6 +378,7 @@ void print_help(const char* name, std::ostream& out = std::cout) {
   out << "  list                List available agents." << endl;
   out << "  all                 Play all agents against each other, output csv summary." << endl;
   out << "  optimize-cell       Tune cell-tree penalties with coarse-to-fine search." << endl;
+  out << "  export-data <agent> Export JSONL expert policy/value training data." << endl;
   out << "  <agent>             Play with the given agent." << endl;
   out << endl;
   out << "Optional arguments:" << endl;
@@ -276,6 +394,19 @@ void print_help(const char* name, std::ostream& out = std::cout) {
   out << "  -j, --threads <n>   Specify the maximum number of threads (default: " << def.num_threads << ")." << endl;
   out << "      --penalties <same> <new> <parent> <edge-in> <wall-in> <open-in> <edge-out> <wall-out> <open-out>" << endl;
   out << "                      Override the 9 cell-tree penalties used by cell-variant (range: 0-100000)." << endl;
+  out << "      --out <file>    export-data output JSONL file, or '-' for stdout." << endl;
+  out << "      --max-samples <n>" << endl;
+  out << "                      Stop export-data after writing n samples. 0 means unlimited." << endl;
+  out << "      --include-length-one" << endl;
+  out << "                      Include the initial length-1 snake states in export-data." << endl;
+  out << "      --policy-value  With export-data, include one-hot policy and discounted value target." << endl;
+  out << "      --expert-gamma <x>" << endl;
+  out << "                      Discount used for export-data value targets (default: " << def.expert_gamma << ")." << endl;
+  out << "      --expert-reward-apple <x>" << endl;
+  out << "      --expert-reward-win <x>" << endl;
+  out << "      --expert-reward-loss <x>" << endl;
+  out << "      --expert-step-penalty <x>" << endl;
+  out << "                      Rewards used when computing export-data value targets." << endl;
   out << endl;
   list_agents(out);
 }
@@ -326,8 +457,116 @@ void Config::parse_optional_args(int argc, const char** argv) {
       use_color = false;
     } else if (arg == "--json-full") {
       json_compact = false;
+    } else if (arg == "--out") {
+      if (i+1 >= argc) throw std::invalid_argument("Missing argument to " + arg);
+      expert_out = argv[++i];
+    } else if (arg == "--max-samples") {
+      if (i+1 >= argc) throw std::invalid_argument("Missing argument to " + arg);
+      max_samples = std::stoi(argv[++i]);
+    } else if (arg == "--include-length-one") {
+      skip_length_one = false;
+    } else if (arg == "--policy-value" || arg == "--expert-policy-value") {
+      expert_policy_value = true;
+    } else if (arg == "--expert-gamma") {
+      if (i+1 >= argc) throw std::invalid_argument("Missing argument to " + arg);
+      expert_gamma = std::stod(argv[++i]);
+    } else if (arg == "--expert-reward-apple") {
+      if (i+1 >= argc) throw std::invalid_argument("Missing argument to " + arg);
+      expert_reward_apple = std::stod(argv[++i]);
+    } else if (arg == "--expert-reward-win") {
+      if (i+1 >= argc) throw std::invalid_argument("Missing argument to " + arg);
+      expert_reward_win = std::stod(argv[++i]);
+    } else if (arg == "--expert-reward-loss") {
+      if (i+1 >= argc) throw std::invalid_argument("Missing argument to " + arg);
+      expert_reward_loss = std::stod(argv[++i]);
+    } else if (arg == "--expert-step-penalty") {
+      if (i+1 >= argc) throw std::invalid_argument("Missing argument to " + arg);
+      expert_step_penalty = std::stod(argv[++i]);
     } else{
       throw std::invalid_argument("Unknown argument: " + arg);
+    }
+    
+  }
+}
+
+double expert_reward_for_event(Game const& game_after_move, Game::Event event, Config const& config) {
+  double reward = config.expert_step_penalty;
+  if (event == Game::Event::eat) {
+    reward += config.expert_reward_apple;
+  }
+  if (event == Game::Event::lose) {
+    reward += config.expert_reward_loss;
+  }
+  if (game_after_move.win()) {
+    reward += config.expert_reward_win;
+  }
+  return reward;
+}
+
+void fill_discounted_values(
+    std::vector<ExpertTransition>& samples,
+    std::vector<double> const& rewards,
+    double gamma
+) {
+  double value = 0.0;
+  for (int i = static_cast<int>(samples.size()) - 1; i >= 0; --i) {
+    value = rewards[i] + gamma * value;
+    samples[i].value = value;
+  }
+}
+
+void export_expert_data(AgentFactory const& agent_factory, Config& config) {
+  config.quiet = true;
+  config.num_threads = 1;
+
+  std::ofstream file;
+  std::ostream* out = &std::cout;
+
+  if (config.expert_out != "-") {
+    file.open(config.expert_out);
+    if (!file) {
+      throw std::runtime_error("Could not open output file: " + config.expert_out);
+    }
+    out = &file;
+  }
+
+  int written = 0;
+
+  while (config.max_samples == 0 || written < config.max_samples) {
+    Game game(config.board_size, config.rng.next_rng());
+    auto agent = agent_factory.make(config);
+
+    Dir prev_dir = Dir::right;
+    std::vector<ExpertTransition> episode_samples;
+    std::vector<double> episode_rewards;
+
+    while (!game.done()) {
+      Dir action = (*agent)(game, nullptr);
+
+      // The very first C++ state has snake length 1 and no real previous dir.
+      // You can skip it, or use action as prev_dir.
+      if (!config.skip_length_one || game.snake.size() >= 2) {
+        Dir prev_for_state = game.turn == 0 ? action : prev_dir;
+        episode_samples.push_back(capture_expert_transition(game, prev_for_state, action));
+      }
+
+      auto event = game.move(action);
+      if (!episode_samples.empty() && episode_samples.size() > episode_rewards.size()) {
+        episode_rewards.push_back(expert_reward_for_event(game, event, config));
+      }
+      prev_dir = action;
+    }
+
+    if (config.expert_policy_value) {
+      fill_discounted_values(episode_samples, episode_rewards, config.expert_gamma);
+    }
+
+    for (auto const& sample : episode_samples) {
+      write_expert_row(*out, sample, config.expert_policy_value);
+      written++;
+      if (config.max_samples > 0 && written >= config.max_samples) {
+        break;
+      }
     }
   }
 }
@@ -567,8 +806,14 @@ void play_all_agents(Config& config, std::ostream& out = std::cout) {
     out << setw(8) << mean(stats.turns) << ", ";
     out << setw(8) << stddev(stats.turns) << ", ";
     out << setprecision(0);
-    for (auto q : quantiles(stats.turns)) {
-      out << setw(8) << q << ", ";
+    if (stats.turns.empty()) {
+      for (int i = 0; i < 5; ++i) {
+        out << setw(8) << "-" << ", ";
+      }
+    } else {
+      for (auto q : quantiles(stats.turns)) {
+        out << setw(8) << q << ", ";
+      }
     }
     out << setprecision(1);
     out << setw(8) << ((1-mean(stats.wins))*100) << "%" << endl;
@@ -812,6 +1057,16 @@ int main(int argc, const char** argv) {
       config.parse_optional_args(argc-2, argv+2);
       ParameterizedCellTreeAgent agent;
       optimize_agent(agent, config);
+    } else if (mode == "export-data") {
+      if (argc < 3) {
+        throw std::invalid_argument("Usage: snake export-data <agent> [args]");
+      }
+
+      auto agent = find_agent(argv[2]);
+      Config config;
+      config.parse_optional_args(argc - 3, argv + 3);
+
+      export_expert_data(agent, config);
     } else {
       auto agent = find_agent(mode);
       Config config;
@@ -835,4 +1090,3 @@ int main(int argc, const char** argv) {
   }
   return EXIT_SUCCESS;
 }
-
